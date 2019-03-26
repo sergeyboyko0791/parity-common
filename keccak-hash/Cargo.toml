@@ -8,7 +8,7 @@ readme = "README.md"
 license = "GPL-3.0"
 
 [dependencies]
-ethereum-types = "0.4"
+ethereum-types = { version = "0.4", default-features = false, features = ["std", "serialize"] }
 tiny-keccak = "1.4"
 
 [dev-dependencies]
