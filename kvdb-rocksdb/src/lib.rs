@@ -1,80 +1,69 @@
-// Copyright 2015-2018 Parity Technologies (UK) Ltd.
-// This file is part of Parity.
+// Copyright 2020 Parity Technologies
+//
+// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
+// http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
+// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your
+// option. This file may not be copied, modified, or distributed
+// except according to those terms.
 
-// Parity is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
+mod iter;
+mod stats;
 
-// Parity is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU General Public License for more details.
-
-// You should have received a copy of the GNU General Public License
-// along with Parity.  If not, see <http://www.gnu.org/licenses/>.
-
-#[macro_use]
-extern crate log;
-
-extern crate elastic_array;
-extern crate fs_swap;
-extern crate interleaved_ordered;
-extern crate num_cpus;
-extern crate parking_lot;
-extern crate regex;
-extern crate parity_rocksdb;
-
-#[cfg(test)]
-extern crate ethereum_types;
-
-extern crate kvdb;
-
-use std::collections::HashMap;
-use std::marker::PhantomData;
-use std::{cmp, fs, io, mem, result, error};
-use std::path::Path;
-
-use parking_lot::{Mutex, MutexGuard, RwLock};
-use parity_rocksdb::{
-	DB, Writable, WriteBatch, WriteOptions, IteratorMode, DBIterator,
-	Options, BlockBasedOptions, Direction, Cache, Column, ReadOptions
+use std::{
+	cmp,
+	collections::HashMap,
+	error, io,
+	path::{Path, PathBuf},
 };
-use interleaved_ordered::{interleave_ordered, InterleaveOrdered};
 
-use elastic_array::ElasticArray32;
-use fs_swap::{swap, swap_nonatomic};
-use kvdb::{KeyValueDB, DBTransaction, DBValue, DBOp};
+use rocksdb::{
+	BlockBasedOptions, ColumnFamily, ColumnFamilyDescriptor, Options, ReadOptions, WriteBatch, WriteOptions, DB,
+};
+
+use kvdb::{DBKeyValue, DBOp, DBTransaction, DBValue, KeyValueDB};
 
 #[cfg(target_os = "linux")]
 use regex::Regex;
 #[cfg(target_os = "linux")]
-use std::process::Command;
-#[cfg(target_os = "linux")]
 use std::fs::File;
 #[cfg(target_os = "linux")]
-use std::path::PathBuf;
+use std::process::Command;
 
-fn other_io_err<E>(e: E) -> io::Error where E: Into<Box<error::Error + Send + Sync>> {
+fn other_io_err<E>(e: E) -> io::Error
+where
+	E: Into<Box<dyn error::Error + Send + Sync>>,
+{
 	io::Error::new(io::ErrorKind::Other, e)
 }
 
-const DB_DEFAULT_MEMORY_BUDGET_MB: usize = 128;
-
-enum KeyState {
-	Insert(DBValue),
-	Delete,
+fn invalid_column(col: u32) -> io::Error {
+	other_io_err(format!("No such column family: {:?}", col))
 }
 
+// Used for memory budget.
+type MiB = usize;
+
+const KB: usize = 1_024;
+const MB: usize = 1_024 * KB;
+
+/// The default column memory budget in MiB.
+pub const DB_DEFAULT_COLUMN_MEMORY_BUDGET_MB: MiB = 128;
+
+/// The default memory budget in MiB.
+pub const DB_DEFAULT_MEMORY_BUDGET_MB: MiB = 512;
+
 /// Compaction profile for the database settings
+/// Note, that changing these parameters may trigger
+/// the compaction process of RocksDB on startup.
+/// https://github.com/facebook/rocksdb/wiki/Leveled-Compaction#level_compaction_dynamic_level_bytes-is-true
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct CompactionProfile {
 	/// L0-L1 target file size
+	/// The minimum size should be calculated in accordance with the
+	/// number of levels and the expected size of the database.
 	pub initial_file_size: u64,
 	/// block size
 	pub block_size: usize,
-	/// rate limiter for background flushes and compactions, bytes/sec, if any
-	pub write_rate_limit: Option<u64>,
 }
 
 impl Default for CompactionProfile {
@@ -91,10 +80,12 @@ pub fn rotational_from_df_output(df_out: Vec<u8>) -> Option<PathBuf> {
 	str::from_utf8(df_out.as_slice())
 		.ok()
 		// Get the drive name.
-		.and_then(|df_str| Regex::new(r"/dev/(sd[:alpha:]{1,2})")
-			.ok()
-			.and_then(|re| re.captures(df_str))
-			.and_then(|captures| captures.get(1)))
+		.and_then(|df_str| {
+			Regex::new(r"/dev/(sd[:alpha:]{1,2})")
+				.ok()
+				.and_then(|re| re.captures(df_str))
+				.and_then(|captures| captures.get(1))
+		})
 		// Generate path e.g. /sys/block/sda/queue/rotational
 		.map(|drive_path| {
 			let mut p = PathBuf::from("/sys/block");
@@ -107,15 +98,13 @@ pub fn rotational_from_df_output(df_out: Vec<u8>) -> Option<PathBuf> {
 impl CompactionProfile {
 	/// Attempt to determine the best profile automatically, only Linux for now.
 	#[cfg(target_os = "linux")]
-	pub fn auto(db_path: &Path) -> CompactionProfile {
+	pub fn auto<P: AsRef<Path>>(db_path: P) -> CompactionProfile {
 		use std::io::Read;
 		let hdd_check_file = db_path
+			.as_ref()
 			.to_str()
 			.and_then(|path_str| Command::new("df").arg(path_str).output().ok())
-			.and_then(|df_res| match df_res.status.success() {
-				true => Some(df_res.stdout),
-				false => None,
-			})
+			.and_then(|df_res| if df_res.status.success() { Some(df_res.stdout) } else { None })
 			.and_then(rotational_from_df_output);
 		// Read out the file and match compaction profile.
 		if let Some(hdd_check) = hdd_check_file {
@@ -123,9 +112,13 @@ impl CompactionProfile {
 				let mut buffer = [0; 1];
 				if file.read_exact(&mut buffer).is_ok() {
 					// 0 means not rotational.
-					if buffer == [48] { return Self::ssd(); }
+					if buffer == [48] {
+						return Self::ssd()
+					}
 					// 1 means rotational.
-					if buffer == [49] { return Self::hdd(); }
+					if buffer == [49] {
+						return Self::hdd()
+					}
 				}
 			}
 		}
@@ -135,57 +128,104 @@ impl CompactionProfile {
 
 	/// Just default for other platforms.
 	#[cfg(not(target_os = "linux"))]
-	pub fn auto(_db_path: &Path) -> CompactionProfile {
+	pub fn auto<P: AsRef<Path>>(_db_path: P) -> CompactionProfile {
 		Self::default()
 	}
 
 	/// Default profile suitable for SSD storage
 	pub fn ssd() -> CompactionProfile {
-		CompactionProfile {
-			initial_file_size: 64 * 1024 * 1024,
-			block_size: 16 * 1024,
-			write_rate_limit: None,
-		}
+		CompactionProfile { initial_file_size: 64 * MB as u64, block_size: 16 * KB }
 	}
 
 	/// Slow HDD compaction profile
 	pub fn hdd() -> CompactionProfile {
-		CompactionProfile {
-			initial_file_size: 256 * 1024 * 1024,
-			block_size: 64 * 1024,
-			write_rate_limit: Some(16 * 1024 * 1024),
-		}
+		CompactionProfile { initial_file_size: 256 * MB as u64, block_size: 64 * KB }
 	}
 }
 
 /// Database configuration
 #[derive(Clone)]
+#[non_exhaustive]
 pub struct DatabaseConfig {
 	/// Max number of open files.
 	pub max_open_files: i32,
-	/// Memory budget (in MiB) used for setting block cache size, write buffer size.
-	pub memory_budget: Option<usize>,
-	/// Compaction profile
+	/// Memory budget (in MiB) used for setting block cache size and
+	/// write buffer size for each column including the default one.
+	/// If the memory budget of a column is not specified,
+	/// `DB_DEFAULT_COLUMN_MEMORY_BUDGET_MB` is used for that column.
+	pub memory_budget: HashMap<u32, MiB>,
+	/// Compaction profile.
 	pub compaction: CompactionProfile,
-	/// Set number of columns
-	pub columns: Option<u32>,
+	/// Set number of columns.
+	///
+	/// # Safety
+	///
+	/// The number of columns must not be zero.
+	pub columns: u32,
+	/// Specify the maximum number of info/debug log files to be kept.
+	pub keep_log_file_num: i32,
+	/// Enable native RocksDB statistics.
+	/// Disabled by default.
+	///
+	/// It can have a negative performance impact up to 10% according to
+	/// https://github.com/facebook/rocksdb/wiki/Statistics.
+	pub enable_statistics: bool,
+	/// Open the database as a secondary instance.
+	/// Specify a path for the secondary instance of the database.
+	/// Secondary instances are read-only and kept updated by tailing the rocksdb MANIFEST.
+	/// It is up to the user to call `catch_up_with_primary()` manually to update the secondary db.
+	/// Disabled by default.
+	///
+	/// `max_open_files` is overridden to always equal `-1`.
+	/// May have a negative performance impact on the secondary instance
+	/// if the secondary instance reads and applies state changes before the primary instance compacts them.
+	/// More info: https://github.com/facebook/rocksdb/wiki/Secondary-instance
+	pub secondary: Option<PathBuf>,
+	/// Limit the size (in bytes) of write ahead logs
+	/// More info: https://github.com/facebook/rocksdb/wiki/Write-Ahead-Log
+	pub max_total_wal_size: Option<u64>,
+	/// Creates a new database if no database exists.
+	/// Set to `true` by default for backwards compatibility.
+	pub create_if_missing: bool,
 }
 
 impl DatabaseConfig {
 	/// Create new `DatabaseConfig` with default parameters and specified set of columns.
 	/// Note that cache sizes must be explicitly set.
-	pub fn with_columns(columns: Option<u32>) -> Self {
-		let mut config = Self::default();
-		config.columns = columns;
-		config
+	///
+	/// # Safety
+	///
+	/// The number of `columns` must not be zero.
+	pub fn with_columns(columns: u32) -> Self {
+		assert!(columns > 0, "the number of columns must not be zero");
+
+		Self { columns, ..Default::default() }
 	}
 
-	pub fn memory_budget(&self) -> usize {
-		self.memory_budget.unwrap_or(DB_DEFAULT_MEMORY_BUDGET_MB) * 1024 * 1024
+	/// Returns the total memory budget in bytes.
+	pub fn memory_budget(&self) -> MiB {
+		(0..self.columns)
+			.map(|i| self.memory_budget.get(&i).unwrap_or(&DB_DEFAULT_COLUMN_MEMORY_BUDGET_MB) * MB)
+			.sum()
 	}
 
-	pub fn memory_budget_per_col(&self) -> usize {
-		self.memory_budget() / self.columns.unwrap_or(1) as usize
+	/// Returns the memory budget of the specified column in bytes.
+	fn memory_budget_for_col(&self, col: u32) -> MiB {
+		self.memory_budget.get(&col).unwrap_or(&DB_DEFAULT_COLUMN_MEMORY_BUDGET_MB) * MB
+	}
+
+	// Get column family configuration with the given block based options.
+	fn column_config(&self, block_opts: &BlockBasedOptions, col: u32) -> Options {
+		let column_mem_budget = self.memory_budget_for_col(col);
+		let mut opts = Options::default();
+
+		opts.set_level_compaction_dynamic_level_bytes(true);
+		opts.set_block_based_table_factory(block_opts);
+		opts.optimize_level_style_compaction(column_mem_budget);
+		opts.set_target_file_size_base(self.compaction.initial_file_size);
+		opts.set_compression_per_level(&[]);
+
+		opts
 	}
 }
 
@@ -193,202 +233,183 @@ impl Default for DatabaseConfig {
 	fn default() -> DatabaseConfig {
 		DatabaseConfig {
 			max_open_files: 512,
-			memory_budget: None,
+			memory_budget: HashMap::new(),
 			compaction: CompactionProfile::default(),
-			columns: None,
+			columns: 1,
+			keep_log_file_num: 1,
+			enable_statistics: false,
+			secondary: None,
+			max_total_wal_size: None,
+			create_if_missing: true,
 		}
-	}
-}
-
-/// Database iterator (for flushed data only)
-// The compromise of holding only a virtual borrow vs. holding a lock on the
-// inner DB (to prevent closing via restoration) may be re-evaluated in the future.
-//
-pub struct DatabaseIterator<'a> {
-	iter: InterleaveOrdered<::std::vec::IntoIter<(Box<[u8]>, Box<[u8]>)>, DBIterator>,
-	_marker: PhantomData<&'a Database>,
-}
-
-impl<'a> Iterator for DatabaseIterator<'a> {
-	type Item = (Box<[u8]>, Box<[u8]>);
-
-	fn next(&mut self) -> Option<Self::Item> {
-		self.iter.next()
 	}
 }
 
 struct DBAndColumns {
 	db: DB,
-	cfs: Vec<Column>,
+	column_names: Vec<String>,
 }
 
-// get column family configuration from database config.
-fn col_config(config: &DatabaseConfig, block_opts: &BlockBasedOptions) -> io::Result<Options> {
-	let mut opts = Options::new();
-
-	opts.set_parsed_options("level_compaction_dynamic_level_bytes=true").map_err(other_io_err)?;
-
-	opts.set_block_based_table_factory(block_opts);
-
-	opts.set_parsed_options(
-		&format!("block_based_table_factory={{{};{}}}",
-				 "cache_index_and_filter_blocks=true",
-				 "pin_l0_filter_and_index_blocks_in_cache=true")).map_err(other_io_err)?;
-
-	opts.optimize_level_style_compaction(config.memory_budget_per_col() as i32);
-	opts.set_target_file_size_base(config.compaction.initial_file_size);
-
-	opts.set_parsed_options("compression_per_level=").map_err(other_io_err)?;
-
-	Ok(opts)
+impl DBAndColumns {
+	fn cf(&self, i: usize) -> io::Result<&ColumnFamily> {
+		let name = self.column_names.get(i).ok_or_else(|| invalid_column(i as u32))?;
+		self.db
+			.cf_handle(&name)
+			.ok_or_else(|| other_io_err(format!("invalid column name: {name}")))
+	}
 }
 
 /// Key-Value database.
 pub struct Database {
-	db: RwLock<Option<DBAndColumns>>,
+	inner: DBAndColumns,
 	config: DatabaseConfig,
+	opts: Options,
 	write_opts: WriteOptions,
 	read_opts: ReadOptions,
 	block_opts: BlockBasedOptions,
-	path: String,
-	// Dirty values added with `write_buffered`. Cleaned on `flush`.
-	overlay: RwLock<Vec<HashMap<ElasticArray32<u8>, KeyState>>>,
-	// Values currently being flushed. Cleared when `flush` completes.
-	flushing: RwLock<Vec<HashMap<ElasticArray32<u8>, KeyState>>>,
-	// Prevents concurrent flushes.
-	// Value indicates if a flush is in progress.
-	flushing_lock: Mutex<bool>,
+	stats: stats::RunningDbStats,
 }
 
-#[inline]
-fn check_for_corruption<T, P: AsRef<Path>>(path: P, res: result::Result<T, String>) -> io::Result<T> {
-	if let Err(ref s) = res {
-		if s.starts_with("Corruption:") {
-			warn!("DB corrupted: {}. Repair will be triggered on next restart", s);
-			let _ = fs::File::create(path.as_ref().join(Database::CORRUPTION_FILE_NAME));
-		}
+/// Generate the options for RocksDB, based on the given `DatabaseConfig`.
+fn generate_options(config: &DatabaseConfig) -> Options {
+	let mut opts = Options::default();
+
+	opts.set_report_bg_io_stats(true);
+	if config.enable_statistics {
+		opts.enable_statistics();
+	}
+	opts.set_use_fsync(false);
+	opts.create_if_missing(config.create_if_missing);
+	if config.secondary.is_some() {
+		opts.set_max_open_files(-1)
+	} else {
+		opts.set_max_open_files(config.max_open_files);
+	}
+	opts.set_bytes_per_sync(1 * MB as u64);
+	opts.set_keep_log_file_num(1);
+	opts.increase_parallelism(cmp::max(1, num_cpus::get() as i32 / 2));
+	if let Some(m) = config.max_total_wal_size {
+		opts.set_max_total_wal_size(m);
 	}
 
-	res.map_err(other_io_err)
+	opts
 }
 
-fn is_corrupted(s: &str) -> bool {
-	s.starts_with("Corruption:") || s.starts_with("Invalid argument: You have to open all column families")
+fn generate_read_options() -> ReadOptions {
+	let mut read_opts = ReadOptions::default();
+	read_opts.set_verify_checksums(false);
+	read_opts
+}
+
+/// Generate the block based options for RocksDB, based on the given `DatabaseConfig`.
+fn generate_block_based_options(config: &DatabaseConfig) -> io::Result<BlockBasedOptions> {
+	let mut block_opts = BlockBasedOptions::default();
+	block_opts.set_block_size(config.compaction.block_size);
+	// See https://github.com/facebook/rocksdb/blob/a1523efcdf2f0e8133b9a9f6e170a0dad49f928f/include/rocksdb/table.h#L246-L271 for details on what the format versions are/do.
+	block_opts.set_format_version(5);
+	block_opts.set_block_restart_interval(16);
+	// Set cache size as recommended by
+	// https://github.com/facebook/rocksdb/wiki/Setup-Options-and-Basic-Tuning#block-cache-size
+	let cache_size = config.memory_budget() / 3;
+	if cache_size == 0 {
+		block_opts.disable_cache()
+	} else {
+		let cache = rocksdb::Cache::new_lru_cache(cache_size).map_err(other_io_err)?;
+		block_opts.set_block_cache(&cache);
+		// "index and filter blocks will be stored in block cache, together with all other data blocks."
+		// See: https://github.com/facebook/rocksdb/wiki/Memory-usage-in-RocksDB#indexes-and-filter-blocks
+		block_opts.set_cache_index_and_filter_blocks(true);
+		// Don't evict L0 filter/index blocks from the cache
+		block_opts.set_pin_l0_filter_and_index_blocks_in_cache(true);
+	}
+	block_opts.set_bloom_filter(10.0, true);
+
+	Ok(block_opts)
 }
 
 impl Database {
-	const CORRUPTION_FILE_NAME: &'static str = "CORRUPTED";
+	/// Open database file.
+	///
+	/// # Safety
+	///
+	/// The number of `config.columns` must not be zero.
+	pub fn open<P: AsRef<Path>>(config: &DatabaseConfig, path: P) -> io::Result<Database> {
+		assert!(config.columns > 0, "the number of columns must not be zero");
 
-	/// Open database with default settings.
-	pub fn open_default(path: &str) -> io::Result<Database> {
-		Database::open(&DatabaseConfig::default(), path)
+		let opts = generate_options(config);
+		let block_opts = generate_block_based_options(config)?;
+
+		let column_names: Vec<_> = (0..config.columns).map(|c| format!("col{}", c)).collect();
+		let write_opts = WriteOptions::default();
+		let read_opts = generate_read_options();
+
+		let db = if let Some(secondary_path) = &config.secondary {
+			Self::open_secondary(&opts, path.as_ref(), secondary_path.as_ref(), column_names.as_slice())?
+		} else {
+			let column_names: Vec<&str> = column_names.iter().map(|s| s.as_str()).collect();
+			Self::open_primary(&opts, path.as_ref(), config, column_names.as_slice(), &block_opts)?
+		};
+
+		Ok(Database {
+			inner: DBAndColumns { db, column_names },
+			config: config.clone(),
+			opts,
+			read_opts,
+			write_opts,
+			block_opts,
+			stats: stats::RunningDbStats::new(),
+		})
 	}
 
-	/// Open database file. Creates if it does not exist.
-	pub fn open(config: &DatabaseConfig, path: &str) -> io::Result<Database> {
-		let mut opts = Options::new();
+	/// Internal api to open a database in primary mode.
+	fn open_primary<P: AsRef<Path>>(
+		opts: &Options,
+		path: P,
+		config: &DatabaseConfig,
+		column_names: &[&str],
+		block_opts: &BlockBasedOptions,
+	) -> io::Result<rocksdb::DB> {
+		let cf_descriptors: Vec<_> = (0..config.columns)
+			.map(|i| ColumnFamilyDescriptor::new(column_names[i as usize], config.column_config(&block_opts, i)))
+			.collect();
 
-		if let Some(rate_limit) = config.compaction.write_rate_limit {
-			opts.set_parsed_options(&format!("rate_limiter_bytes_per_sec={}", rate_limit)).map_err(other_io_err)?;
-		}
-		opts.set_use_fsync(false);
-		opts.create_if_missing(true);
-		opts.set_max_open_files(config.max_open_files);
-		opts.set_parsed_options("keep_log_file_num=1").map_err(other_io_err)?;
-		opts.set_parsed_options("bytes_per_sync=1048576").map_err(other_io_err)?;
-		opts.set_db_write_buffer_size(config.memory_budget_per_col() / 2);
-		opts.increase_parallelism(cmp::max(1, ::num_cpus::get() as i32 / 2));
-
-		let mut block_opts = BlockBasedOptions::new();
-
-		{
-			block_opts.set_block_size(config.compaction.block_size);
-			let cache_size = cmp::max(8, config.memory_budget() / 3);
-			let cache = Cache::new(cache_size);
-			block_opts.set_cache(cache);
-		}
-
-		// attempt database repair if it has been previously marked as corrupted
-		let db_corrupted = Path::new(path).join(Database::CORRUPTION_FILE_NAME);
-		if db_corrupted.exists() {
-			warn!("DB has been previously marked as corrupted, attempting repair");
-			DB::repair(&opts, path).map_err(other_io_err)?;
-			fs::remove_file(db_corrupted)?;
-		}
-
-		let columns = config.columns.unwrap_or(0) as usize;
-
-		let mut cf_options = Vec::with_capacity(columns);
-		let cfnames: Vec<_> = (0..columns).map(|c| format!("col{}", c)).collect();
-		let cfnames: Vec<&str> = cfnames.iter().map(|n| n as &str).collect();
-
-		for _ in 0 .. config.columns.unwrap_or(0) {
-			cf_options.push(col_config(&config, &block_opts)?);
-		}
-
-		let write_opts = WriteOptions::new();
-		let mut read_opts = ReadOptions::new();
-		read_opts.set_verify_checksums(false);
-
-		let mut cfs: Vec<Column> = Vec::new();
-		let db = match config.columns {
-			Some(_) => {
-				match DB::open_cf(&opts, path, &cfnames, &cf_options) {
-					Ok(db) => {
-						cfs = cfnames.iter().map(|n| db.cf_handle(n)
-							.expect("rocksdb opens a cf_handle for each cfname; qed")).collect();
-						Ok(db)
-					}
-					Err(_) => {
-						// retry and create CFs
-						match DB::open_cf(&opts, path, &[], &[]) {
-							Ok(mut db) => {
-								cfs = cfnames.iter()
-									.enumerate()
-									.map(|(i, n)| db.create_cf(n, &cf_options[i]))
-									.collect::<::std::result::Result<_, _>>()
-									.map_err(other_io_err)?;
-								Ok(db)
-							},
-							err => err,
+		let db = match DB::open_cf_descriptors(&opts, path.as_ref(), cf_descriptors) {
+			Err(_) => {
+				// retry and create CFs
+				match DB::open_cf(&opts, path.as_ref(), &[] as &[&str]) {
+					Ok(mut db) => {
+						for (i, name) in column_names.iter().enumerate() {
+							let _ = db
+								.create_cf(name, &config.column_config(&block_opts, i as u32))
+								.map_err(other_io_err)?;
 						}
-					}
-				}
-			},
-			None => DB::open(&opts, path)
-		};
-
-		let db = match db {
-			Ok(db) => db,
-			Err(ref s) if is_corrupted(s) => {
-				warn!("DB corrupted: {}, attempting repair", s);
-				DB::repair(&opts, path).map_err(other_io_err)?;
-
-				match cfnames.is_empty() {
-					true => DB::open(&opts, path).map_err(other_io_err)?,
-					false => {
-						let db = DB::open_cf(&opts, path, &cfnames, &cf_options).map_err(other_io_err)?;
-						cfs = cfnames.iter().map(|n| db.cf_handle(n)
-							.expect("rocksdb opens a cf_handle for each cfname; qed")).collect();
-						db
+						Ok(db)
 					},
+					err => err,
 				}
 			},
-			Err(s) => {
-				return Err(other_io_err(s))
-			}
+			ok => ok,
 		};
-		let num_cols = cfs.len();
-		Ok(Database {
-			db: RwLock::new(Some(DBAndColumns{ db: db, cfs: cfs })),
-			config: config.clone(),
-			write_opts: write_opts,
-			overlay: RwLock::new((0..(num_cols + 1)).map(|_| HashMap::new()).collect()),
-			flushing: RwLock::new((0..(num_cols + 1)).map(|_| HashMap::new()).collect()),
-			flushing_lock: Mutex::new(false),
-			path: path.to_owned(),
-			read_opts: read_opts,
-			block_opts: block_opts,
+
+		Ok(match db {
+			Ok(db) => db,
+			Err(s) => return Err(other_io_err(s)),
+		})
+	}
+
+	/// Internal api to open a database in secondary mode.
+	/// Secondary database needs a seperate path to store its own logs.
+	fn open_secondary<P: AsRef<Path>>(
+		opts: &Options,
+		path: P,
+		secondary_path: P,
+		column_names: &[String],
+	) -> io::Result<rocksdb::DB> {
+		let db = DB::open_cf_as_secondary(&opts, path.as_ref(), secondary_path.as_ref(), column_names);
+
+		Ok(match db {
+			Ok(db) => db,
+			Err(s) => return Err(other_io_err(s)),
 		})
 	}
 
@@ -397,388 +418,323 @@ impl Database {
 		DBTransaction::new()
 	}
 
-	fn to_overlay_column(col: Option<u32>) -> usize {
-		col.map_or(0, |c| (c + 1) as usize)
-	}
-
-	/// Commit transaction to database.
-	pub fn write_buffered(&self, tr: DBTransaction) {
-		let mut overlay = self.overlay.write();
-		let ops = tr.ops;
-		for op in ops {
-			match op {
-				DBOp::Insert { col, key, value } => {
-					let c = Self::to_overlay_column(col);
-					overlay[c].insert(key, KeyState::Insert(value));
-				},
-				DBOp::Delete { col, key } => {
-					let c = Self::to_overlay_column(col);
-					overlay[c].insert(key, KeyState::Delete);
-				},
-			}
-		};
-	}
-
-	/// Commit buffered changes to database. Must be called under `flush_lock`
-	fn write_flushing_with_lock(&self, _lock: &mut MutexGuard<bool>) -> io::Result<()> {
-		match *self.db.read() {
-			Some(DBAndColumns { ref db, ref cfs }) => {
-				let batch = WriteBatch::new();
-				mem::swap(&mut *self.overlay.write(), &mut *self.flushing.write());
-				{
-					for (c, column) in self.flushing.read().iter().enumerate() {
-						for (key, state) in column.iter() {
-							match *state {
-								KeyState::Delete => {
-									if c > 0 {
-										batch.delete_cf(cfs[c - 1], key).map_err(other_io_err)?;
-									} else {
-										batch.delete(key).map_err(other_io_err)?;
-									}
-								},
-								KeyState::Insert(ref value) => {
-									if c > 0 {
-										batch.put_cf(cfs[c - 1], key, value).map_err(other_io_err)?;
-									} else {
-										batch.put(key, value).map_err(other_io_err)?;
-									}
-								},
-							}
-						}
-					}
-				}
-
-				check_for_corruption(
-					&self.path,
-					db.write_opt(batch, &self.write_opts))?;
-
-				for column in self.flushing.write().iter_mut() {
-					column.clear();
-					column.shrink_to_fit();
-				}
-				Ok(())
-			},
-			None => Err(other_io_err("Database is closed"))
-		}
-	}
-
-	/// Commit buffered changes to database.
-	pub fn flush(&self) -> io::Result<()> {
-		let mut lock = self.flushing_lock.lock();
-		// If RocksDB batch allocation fails the thread gets terminated and the lock is released.
-		// The value inside the lock is used to detect that.
-		if *lock {
-			// This can only happen if another flushing thread is terminated unexpectedly.
-			return Err(other_io_err("Database write failure. Running low on memory perhaps?"))
-		}
-		*lock = true;
-		let result = self.write_flushing_with_lock(&mut lock);
-		*lock = false;
-		result
-	}
-
 	/// Commit transaction to database.
 	pub fn write(&self, tr: DBTransaction) -> io::Result<()> {
-		match *self.db.read() {
-			Some(DBAndColumns { ref db, ref cfs }) => {
-				let batch = WriteBatch::new();
-				let ops = tr.ops;
-				for op in ops {
-					// remove any buffered operation for this key
-					self.overlay.write()[Self::to_overlay_column(op.col())].remove(op.key());
+		let cfs = &self.inner;
+		let mut batch = WriteBatch::default();
+		let ops = tr.ops;
 
-					match op {
-						DBOp::Insert { col, key, value } => match col {
-							None => batch.put(&key, &value).map_err(other_io_err)?,
-							Some(c) => batch.put_cf(cfs[c as usize], &key, &value).map_err(other_io_err)?,
-						},
-						DBOp::Delete { col, key } => match col {
-							None => batch.delete(&key).map_err(other_io_err)?,
-							Some(c) => batch.delete_cf(cfs[c as usize], &key).map_err(other_io_err)?,
+		self.stats.tally_writes(ops.len() as u64);
+		self.stats.tally_transactions(1);
+
+		let mut stats_total_bytes = 0;
+
+		for op in ops {
+			let col = op.col();
+			let cf = cfs.cf(col as usize)?;
+
+			match op {
+				DBOp::Insert { col: _, key, value } => {
+					stats_total_bytes += key.len() + value.len();
+					batch.put_cf(cf, &key, &value);
+				},
+				DBOp::Delete { col: _, key } => {
+					// We count deletes as writes.
+					stats_total_bytes += key.len();
+					batch.delete_cf(cf, &key);
+				},
+				DBOp::DeletePrefix { col, prefix } => {
+					let end_prefix = kvdb::end_prefix(&prefix[..]);
+					let no_end = end_prefix.is_none();
+					let end_range = end_prefix.unwrap_or_else(|| vec![u8::max_value(); 16]);
+					batch.delete_range_cf(cf, &prefix[..], &end_range[..]);
+					if no_end {
+						let prefix = if prefix.len() > end_range.len() { &prefix[..] } else { &end_range[..] };
+						for result in self.iter_with_prefix(col, prefix) {
+							let (key, _) = result?;
+							batch.delete_cf(cf, &key[..]);
 						}
 					}
-				}
-
-				check_for_corruption(&self.path, db.write_opt(batch, &self.write_opts))
-			},
-			None => Err(other_io_err("Database is closed")),
+				},
+			};
 		}
+		self.stats.tally_bytes_written(stats_total_bytes as u64);
+
+		cfs.db.write_opt(batch, &self.write_opts).map_err(other_io_err)
 	}
 
 	/// Get value by key.
-	pub fn get(&self, col: Option<u32>, key: &[u8]) -> io::Result<Option<DBValue>> {
-		match *self.db.read() {
-			Some(DBAndColumns { ref db, ref cfs }) => {
-				let overlay = &self.overlay.read()[Self::to_overlay_column(col)];
-				match overlay.get(key) {
-					Some(&KeyState::Insert(ref value)) => Ok(Some(value.clone())),
-					Some(&KeyState::Delete) => Ok(None),
-					None => {
-						let flushing = &self.flushing.read()[Self::to_overlay_column(col)];
-						match flushing.get(key) {
-							Some(&KeyState::Insert(ref value)) => Ok(Some(value.clone())),
-							Some(&KeyState::Delete) => Ok(None),
-							None => {
-								col.map_or_else(
-									|| db.get_opt(key, &self.read_opts).map(|r| r.map(|v| DBValue::from_slice(&v))),
-									|c| db.get_cf_opt(cfs[c as usize], key, &self.read_opts).map(|r| r.map(|v| DBValue::from_slice(&v))))
-									.map_err(other_io_err)
-							},
-						}
-					},
-				}
-			},
-			None => Ok(None),
+	pub fn get(&self, col: u32, key: &[u8]) -> io::Result<Option<DBValue>> {
+		let cfs = &self.inner;
+		let cf = cfs.cf(col as usize)?;
+		self.stats.tally_reads(1);
+		let value = cfs
+			.db
+			.get_pinned_cf_opt(cf, key, &self.read_opts)
+			.map(|r| r.map(|v| v.to_vec()))
+			.map_err(other_io_err);
+
+		match value {
+			Ok(Some(ref v)) => self.stats.tally_bytes_read((key.len() + v.len()) as u64),
+			Ok(None) => self.stats.tally_bytes_read(key.len() as u64),
+			_ => {},
+		};
+
+		value
+	}
+
+	/// Get value by partial key. Prefix size should match configured prefix size.
+	pub fn get_by_prefix(&self, col: u32, prefix: &[u8]) -> io::Result<Option<DBValue>> {
+		self.iter_with_prefix(col, prefix)
+			.next()
+			.transpose()
+			.map(|m| m.map(|(_k, v)| v))
+	}
+
+	/// Iterator over the data in the given database column index.
+	/// Will hold a lock until the iterator is dropped
+	/// preventing the database from being closed.
+	pub fn iter<'a>(&'a self, col: u32) -> impl Iterator<Item = io::Result<DBKeyValue>> + 'a {
+		let read_opts = generate_read_options();
+		iter::IterationHandler::iter(&self.inner, col, read_opts)
+	}
+
+	/// Iterator over data in the `col` database column index matching the given prefix.
+	/// Will hold a lock until the iterator is dropped
+	/// preventing the database from being closed.
+	fn iter_with_prefix<'a>(&'a self, col: u32, prefix: &'a [u8]) -> impl Iterator<Item = io::Result<DBKeyValue>> + 'a {
+		let mut read_opts = generate_read_options();
+		// rocksdb doesn't work with an empty upper bound
+		if let Some(end_prefix) = kvdb::end_prefix(prefix) {
+			read_opts.set_iterate_upper_bound(end_prefix);
+		}
+		iter::IterationHandler::iter_with_prefix(&self.inner, col, prefix, read_opts)
+	}
+
+	/// The number of column families in the db.
+	pub fn num_columns(&self) -> u32 {
+		self.inner.column_names.len() as u32
+	}
+
+	/// The number of keys in a column (estimated).
+	pub fn num_keys(&self, col: u32) -> io::Result<u64> {
+		const ESTIMATE_NUM_KEYS: &str = "rocksdb.estimate-num-keys";
+		let cfs = &self.inner;
+		let cf = cfs.cf(col as usize)?;
+		match cfs.db.property_int_value_cf(cf, ESTIMATE_NUM_KEYS) {
+			Ok(estimate) => Ok(estimate.unwrap_or_default()),
+			Err(err_string) => Err(other_io_err(err_string)),
 		}
 	}
 
-	/// Get value by partial key. Prefix size should match configured prefix size. Only searches flushed values.
-	// TODO: support prefix seek for unflushed data
-	pub fn get_by_prefix(&self, col: Option<u32>, prefix: &[u8]) -> Option<Box<[u8]>> {
-		self.iter_from_prefix(col, prefix).and_then(|mut iter| {
-			match iter.next() {
-				// TODO: use prefix_same_as_start read option (not availabele in C API currently)
-				Some((k, v)) => if k[0 .. prefix.len()] == prefix[..] { Some(v) } else { None },
-				_ => None
-			}
-		})
-	}
-
-	/// Get database iterator for flushed data.
-	pub fn iter(&self, col: Option<u32>) -> Option<DatabaseIterator> {
-		match *self.db.read() {
-			Some(DBAndColumns { ref db, ref cfs }) => {
-				let overlay = &self.overlay.read()[Self::to_overlay_column(col)];
-				let mut overlay_data = overlay.iter()
-					.filter_map(|(k, v)| match *v {
-						KeyState::Insert(ref value) =>
-							Some((k.clone().into_vec().into_boxed_slice(), value.clone().into_vec().into_boxed_slice())),
-						KeyState::Delete => None,
-					}).collect::<Vec<_>>();
-				overlay_data.sort();
-
-				let iter = col.map_or_else(
-					|| db.iterator_opt(IteratorMode::Start, &self.read_opts),
-					|c| db.iterator_cf_opt(cfs[c as usize], IteratorMode::Start, &self.read_opts)
-						.expect("iterator params are valid; qed")
-				);
-
-				Some(DatabaseIterator {
-					iter: interleave_ordered(overlay_data, iter),
-					_marker: PhantomData,
-				})
-			},
-			None => None,
+	/// Remove the last column family in the database. The deletion is definitive.
+	pub fn remove_last_column(&mut self) -> io::Result<()> {
+		let DBAndColumns { ref mut db, ref mut column_names } = self.inner;
+		if let Some(name) = column_names.pop() {
+			db.drop_cf(&name).map_err(other_io_err)?;
 		}
-	}
-
-	fn iter_from_prefix(&self, col: Option<u32>, prefix: &[u8]) -> Option<DatabaseIterator> {
-		match *self.db.read() {
-			Some(DBAndColumns { ref db, ref cfs }) => {
-				let iter = col.map_or_else(|| db.iterator_opt(IteratorMode::From(prefix, Direction::Forward), &self.read_opts),
-					|c| db.iterator_cf_opt(cfs[c as usize], IteratorMode::From(prefix, Direction::Forward), &self.read_opts)
-						.expect("iterator params are valid; qed"));
-
-				Some(DatabaseIterator {
-					iter: interleave_ordered(Vec::new(), iter),
-					_marker: PhantomData,
-				})
-			},
-			None => None,
-		}
-	}
-
-	/// Close the database
-	fn close(&self) {
-		*self.db.write() = None;
-		self.overlay.write().clear();
-		self.flushing.write().clear();
-	}
-
-	/// Restore the database from a copy at given path.
-	pub fn restore(&self, new_db: &str) -> io::Result<()> {
-		self.close();
-
-		// swap is guaranteed to be atomic
-		match swap(new_db, &self.path) {
-			Ok(_) => {
-				// ignore errors
-				let _ = fs::remove_dir_all(new_db);
-			},
-			Err(err) => {
-				debug!("DB atomic swap failed: {}", err);
-				match swap_nonatomic(new_db, &self.path) {
-					Ok(_) => {
-						// ignore errors
-						let _ = fs::remove_dir_all(new_db);
-					},
-					Err(err) => {
-						warn!("Failed to swap DB directories: {:?}", err);
-						return Err(io::Error::new(io::ErrorKind::Other, "DB restoration failed: could not swap DB directories"));
-					}
-				}
-			}
-		}
-
-		// reopen the database and steal handles into self
-		let db = Self::open(&self.config, &self.path)?;
-		*self.db.write() = mem::replace(&mut *db.db.write(), None);
-		*self.overlay.write() = mem::replace(&mut *db.overlay.write(), Vec::new());
-		*self.flushing.write() = mem::replace(&mut *db.flushing.write(), Vec::new());
 		Ok(())
 	}
 
-	/// The number of non-default column families.
-	pub fn num_columns(&self) -> u32 {
-		self.db.read().as_ref()
-			.and_then(|db| if db.cfs.is_empty() { None } else { Some(db.cfs.len()) } )
-			.map(|n| n as u32)
-			.unwrap_or(0)
+	/// Add a new column family to the DB.
+	pub fn add_column(&mut self) -> io::Result<()> {
+		let DBAndColumns { ref mut db, ref mut column_names } = self.inner;
+		let col = column_names.len() as u32;
+		let name = format!("col{}", col);
+		let col_config = self.config.column_config(&self.block_opts, col as u32);
+		let _ = db.create_cf(&name, &col_config).map_err(other_io_err)?;
+		column_names.push(name);
+		Ok(())
 	}
 
-	/// Drop a column family.
-	pub fn drop_column(&self) -> io::Result<()> {
-		match *self.db.write() {
-			Some(DBAndColumns { ref mut db, ref mut cfs }) => {
-				if let Some(col) = cfs.pop() {
-					let name = format!("col{}", cfs.len());
-					drop(col);
-					db.drop_cf(&name).map_err(other_io_err)?;
-				}
-				Ok(())
-			},
-			None => Ok(()),
+	/// Get RocksDB statistics.
+	pub fn get_statistics(&self) -> HashMap<String, stats::RocksDbStatsValue> {
+		if let Some(stats) = self.opts.get_statistics() {
+			stats::parse_rocksdb_stats(&stats)
+		} else {
+			HashMap::new()
 		}
 	}
 
-	/// Add a column family.
-	pub fn add_column(&self) -> io::Result<()> {
-		match *self.db.write() {
-			Some(DBAndColumns { ref mut db, ref mut cfs }) => {
-				let col = cfs.len() as u32;
-				let name = format!("col{}", col);
-				cfs.push(db.create_cf(&name, &col_config(&self.config, &self.block_opts)?).map_err(other_io_err)?);
-				Ok(())
-			},
-			None => Ok(()),
-		}
+	/// Try to catch up a secondary instance with
+	/// the primary by reading as much from the logs as possible.
+	///
+	/// Guaranteed to have changes up to the the time that `try_catch_up_with_primary` is called
+	/// if it finishes succesfully.
+	///
+	/// Blocks until the MANIFEST file and any state changes in the corresponding Write-Ahead-Logs
+	/// are applied to the secondary instance. If the manifest files are very large
+	/// this method could take a long time.
+	///
+	/// If Write-Ahead-Logs have been purged by the primary instance before the secondary
+	/// is able to open them, the secondary will not be caught up
+	/// until this function is called again and new Write-Ahead-Logs are identified.
+	///
+	/// If called while the primary is writing, the catch-up may fail.
+	///
+	/// If the secondary is unable to catch up because of missing logs,
+	/// this method fails silently and no error is returned.
+	///
+	/// Calling this as primary will return an error.
+	pub fn try_catch_up_with_primary(&self) -> io::Result<()> {
+		self.inner.db.try_catch_up_with_primary().map_err(other_io_err)
 	}
 }
 
 // duplicate declaration of methods here to avoid trait import in certain existing cases
 // at time of addition.
 impl KeyValueDB for Database {
-	fn get(&self, col: Option<u32>, key: &[u8]) -> io::Result<Option<DBValue>> {
+	fn get(&self, col: u32, key: &[u8]) -> io::Result<Option<DBValue>> {
 		Database::get(self, col, key)
 	}
 
-	fn get_by_prefix(&self, col: Option<u32>, prefix: &[u8]) -> Option<Box<[u8]>> {
+	fn get_by_prefix(&self, col: u32, prefix: &[u8]) -> io::Result<Option<DBValue>> {
 		Database::get_by_prefix(self, col, prefix)
-	}
-
-	fn write_buffered(&self, transaction: DBTransaction) {
-		Database::write_buffered(self, transaction)
 	}
 
 	fn write(&self, transaction: DBTransaction) -> io::Result<()> {
 		Database::write(self, transaction)
 	}
 
-	fn flush(&self) -> io::Result<()> {
-		Database::flush(self)
-	}
-
-	fn iter<'a>(&'a self, col: Option<u32>) -> Box<Iterator<Item=(Box<[u8]>, Box<[u8]>)> + 'a> {
+	fn iter<'a>(&'a self, col: u32) -> Box<dyn Iterator<Item = io::Result<DBKeyValue>> + 'a> {
 		let unboxed = Database::iter(self, col);
-		Box::new(unboxed.into_iter().flat_map(|inner| inner))
+		Box::new(unboxed.into_iter())
 	}
 
-	fn iter_from_prefix<'a>(&'a self, col: Option<u32>, prefix: &'a [u8])
-		-> Box<Iterator<Item=(Box<[u8]>, Box<[u8]>)> + 'a>
-	{
-		let unboxed = Database::iter_from_prefix(self, col, prefix);
-		Box::new(unboxed.into_iter().flat_map(|inner| inner))
+	fn iter_with_prefix<'a>(
+		&'a self,
+		col: u32,
+		prefix: &'a [u8],
+	) -> Box<dyn Iterator<Item = io::Result<DBKeyValue>> + 'a> {
+		let unboxed = Database::iter_with_prefix(self, col, prefix);
+		Box::new(unboxed.into_iter())
 	}
 
-	fn restore(&self, new_db: &str) -> io::Result<()> {
-		Database::restore(self, new_db)
-	}
-}
+	fn io_stats(&self, kind: kvdb::IoStatsKind) -> kvdb::IoStats {
+		let rocksdb_stats = self.get_statistics();
+		let cache_hit_count = rocksdb_stats.get("block.cache.hit").map(|s| s.count).unwrap_or(0u64);
+		let overall_stats = self.stats.overall();
+		let old_cache_hit_count = overall_stats.raw.cache_hit_count;
 
-impl Drop for Database {
-	fn drop(&mut self) {
-		// write all buffered changes if we can.
-		let _ = self.flush();
+		self.stats.tally_cache_hit_count(cache_hit_count - old_cache_hit_count);
+
+		let taken_stats = match kind {
+			kvdb::IoStatsKind::Overall => self.stats.overall(),
+			kvdb::IoStatsKind::SincePrevious => self.stats.since_previous(),
+		};
+
+		let mut stats = kvdb::IoStats::empty();
+
+		stats.reads = taken_stats.raw.reads;
+		stats.writes = taken_stats.raw.writes;
+		stats.transactions = taken_stats.raw.transactions;
+		stats.bytes_written = taken_stats.raw.bytes_written;
+		stats.bytes_read = taken_stats.raw.bytes_read;
+		stats.cache_reads = taken_stats.raw.cache_hit_count;
+		stats.started = taken_stats.started;
+		stats.span = taken_stats.started.elapsed();
+
+		stats
 	}
 }
 
 #[cfg(test)]
 mod tests {
-	extern crate tempdir;
-
-	use std::str::FromStr;
-	use self::tempdir::TempDir;
-	use ethereum_types::H256;
 	use super::*;
+	use kvdb_shared_tests as st;
+	use std::io::{self, Read};
+	use tempfile::Builder as TempfileBuilder;
 
-	fn test_db(config: &DatabaseConfig) {
-		let tempdir = TempDir::new("").unwrap();
-		let db = Database::open(config, tempdir.path().to_str().unwrap()).unwrap();
-		let key1 = H256::from_str("02c69be41d0b7e40352fc85be1cd65eb03d40ef8427a0ca4596b1ead9a00e9fc").unwrap();
-		let key2 = H256::from_str("03c69be41d0b7e40352fc85be1cd65eb03d40ef8427a0ca4596b1ead9a00e9fc").unwrap();
-		let key3 = H256::from_str("01c69be41d0b7e40352fc85be1cd65eb03d40ef8427a0ca4596b1ead9a00e9fc").unwrap();
-
-		let mut batch = db.transaction();
-		batch.put(None, &key1, b"cat");
-		batch.put(None, &key2, b"dog");
-		db.write(batch).unwrap();
-
-		assert_eq!(&*db.get(None, &key1).unwrap().unwrap(), b"cat");
-
-		let contents: Vec<_> = db.iter(None).into_iter().flat_map(|inner| inner).collect();
-		assert_eq!(contents.len(), 2);
-		assert_eq!(&*contents[0].0, &*key1);
-		assert_eq!(&*contents[0].1, b"cat");
-		assert_eq!(&*contents[1].0, &*key2);
-		assert_eq!(&*contents[1].1, b"dog");
-
-		let mut batch = db.transaction();
-		batch.delete(None, &key1);
-		db.write(batch).unwrap();
-
-		assert!(db.get(None, &key1).unwrap().is_none());
-
-		let mut batch = db.transaction();
-		batch.put(None, &key1, b"cat");
-		db.write(batch).unwrap();
-
-		let mut transaction = db.transaction();
-		transaction.put(None, &key3, b"elephant");
-		transaction.delete(None, &key1);
-		db.write(transaction).unwrap();
-		assert!(db.get(None, &key1).unwrap().is_none());
-		assert_eq!(&*db.get(None, &key3).unwrap().unwrap(), b"elephant");
-
-		assert_eq!(&*db.get_by_prefix(None, &key3).unwrap(), b"elephant");
-		assert_eq!(&*db.get_by_prefix(None, &key2).unwrap(), b"dog");
-
-		let mut transaction = db.transaction();
-		transaction.put(None, &key1, b"horse");
-		transaction.delete(None, &key3);
-		db.write_buffered(transaction);
-		assert!(db.get(None, &key3).unwrap().is_none());
-		assert_eq!(&*db.get(None, &key1).unwrap().unwrap(), b"horse");
-
-		db.flush().unwrap();
-		assert!(db.get(None, &key3).unwrap().is_none());
-		assert_eq!(&*db.get(None, &key1).unwrap().unwrap(), b"horse");
+	fn create(columns: u32) -> io::Result<Database> {
+		let tempdir = TempfileBuilder::new().prefix("").tempdir()?;
+		let config = DatabaseConfig::with_columns(columns);
+		Database::open(&config, tempdir.path().to_str().expect("tempdir path is valid unicode"))
 	}
 
 	#[test]
-	fn kvdb() {
-		let tempdir = TempDir::new("").unwrap();
-		let _ = Database::open_default(tempdir.path().to_str().unwrap()).unwrap();
-		test_db(&DatabaseConfig::default());
+	fn get_fails_with_non_existing_column() -> io::Result<()> {
+		let db = create(1)?;
+		st::test_get_fails_with_non_existing_column(&db)
+	}
+
+	#[test]
+	fn put_and_get() -> io::Result<()> {
+		let db = create(1)?;
+		st::test_put_and_get(&db)
+	}
+
+	#[test]
+	fn delete_and_get() -> io::Result<()> {
+		let db = create(1)?;
+		st::test_delete_and_get(&db)
+	}
+
+	#[test]
+	fn delete_prefix() -> io::Result<()> {
+		let db = create(st::DELETE_PREFIX_NUM_COLUMNS)?;
+		st::test_delete_prefix(&db)
+	}
+
+	#[test]
+	fn iter() -> io::Result<()> {
+		let db = create(1)?;
+		st::test_iter(&db)
+	}
+
+	#[test]
+	fn iter_with_prefix() -> io::Result<()> {
+		let db = create(1)?;
+		st::test_iter_with_prefix(&db)
+	}
+
+	#[test]
+	fn complex() -> io::Result<()> {
+		let db = create(1)?;
+		st::test_complex(&db)
+	}
+
+	#[test]
+	fn stats() -> io::Result<()> {
+		let db = create(st::IO_STATS_NUM_COLUMNS)?;
+		st::test_io_stats(&db)
+	}
+
+	#[test]
+	fn secondary_db_get() -> io::Result<()> {
+		let primary = TempfileBuilder::new().prefix("").tempdir()?;
+		let secondary = TempfileBuilder::new().prefix("").tempdir()?;
+		let config = DatabaseConfig::with_columns(1);
+		let db = Database::open(&config, primary.path()).unwrap();
+
+		let key1 = b"key1";
+		let mut transaction = db.transaction();
+		transaction.put(0, key1, b"horse");
+		db.write(transaction)?;
+
+		let config = DatabaseConfig { secondary: Some(secondary.path().to_owned()), ..DatabaseConfig::with_columns(1) };
+		let second_db = Database::open(&config, primary.path()).unwrap();
+		assert_eq!(&*second_db.get(0, key1)?.unwrap(), b"horse");
+		Ok(())
+	}
+
+	#[test]
+	fn secondary_db_catch_up() -> io::Result<()> {
+		let primary = TempfileBuilder::new().prefix("").tempdir()?;
+		let secondary = TempfileBuilder::new().prefix("").tempdir()?;
+		let config = DatabaseConfig::with_columns(1);
+		let db = Database::open(&config, primary.path()).unwrap();
+
+		let config = DatabaseConfig { secondary: Some(secondary.path().to_owned()), ..DatabaseConfig::with_columns(1) };
+		let second_db = Database::open(&config, primary.path()).unwrap();
+
+		let mut transaction = db.transaction();
+		transaction.put(0, b"key1", b"mule");
+		transaction.put(0, b"key2", b"cat");
+		db.write(transaction)?;
+
+		second_db.try_catch_up_with_primary()?;
+		assert_eq!(&*second_db.get(0, b"key2")?.unwrap(), b"cat");
+		Ok(())
 	}
 
 	#[test]
@@ -786,26 +742,45 @@ mod tests {
 	fn df_to_rotational() {
 		use std::path::PathBuf;
 		// Example df output.
-		let example_df = vec![70, 105, 108, 101, 115, 121, 115, 116, 101, 109, 32, 32, 32, 32, 32, 49, 75, 45, 98, 108, 111, 99, 107, 115, 32, 32, 32, 32, 32, 85, 115, 101, 100, 32, 65, 118, 97, 105, 108, 97, 98, 108, 101, 32, 85, 115, 101, 37, 32, 77, 111, 117, 110, 116, 101, 100, 32, 111, 110, 10, 47, 100, 101, 118, 47, 115, 100, 97, 49, 32, 32, 32, 32, 32, 32, 32, 54, 49, 52, 48, 57, 51, 48, 48, 32, 51, 56, 56, 50, 50, 50, 51, 54, 32, 32, 49, 57, 52, 52, 52, 54, 49, 54, 32, 32, 54, 55, 37, 32, 47, 10];
+		let example_df = vec![
+			70, 105, 108, 101, 115, 121, 115, 116, 101, 109, 32, 32, 32, 32, 32, 49, 75, 45, 98, 108, 111, 99, 107,
+			115, 32, 32, 32, 32, 32, 85, 115, 101, 100, 32, 65, 118, 97, 105, 108, 97, 98, 108, 101, 32, 85, 115, 101,
+			37, 32, 77, 111, 117, 110, 116, 101, 100, 32, 111, 110, 10, 47, 100, 101, 118, 47, 115, 100, 97, 49, 32,
+			32, 32, 32, 32, 32, 32, 54, 49, 52, 48, 57, 51, 48, 48, 32, 51, 56, 56, 50, 50, 50, 51, 54, 32, 32, 49, 57,
+			52, 52, 52, 54, 49, 54, 32, 32, 54, 55, 37, 32, 47, 10,
+		];
 		let expected_output = Some(PathBuf::from("/sys/block/sda/queue/rotational"));
 		assert_eq!(rotational_from_df_output(example_df), expected_output);
 	}
 
 	#[test]
+	#[should_panic]
+	fn db_config_with_zero_columns() {
+		let _cfg = DatabaseConfig::with_columns(0);
+	}
+
+	#[test]
+	#[should_panic]
+	fn open_db_with_zero_columns() {
+		let cfg = DatabaseConfig { columns: 0, ..Default::default() };
+		let _db = Database::open(&cfg, "");
+	}
+
+	#[test]
 	fn add_columns() {
-		let config = DatabaseConfig::default();
-		let config_5 = DatabaseConfig::with_columns(Some(5));
+		let config_1 = DatabaseConfig::default();
+		let config_5 = DatabaseConfig::with_columns(5);
 
-		let tempdir = TempDir::new("").unwrap();
+		let tempdir = TempfileBuilder::new().prefix("").tempdir().unwrap();
 
-		// open empty, add 5.
+		// open 1, add 4.
 		{
-			let db = Database::open(&config, tempdir.path().to_str().unwrap()).unwrap();
-			assert_eq!(db.num_columns(), 0);
+			let mut db = Database::open(&config_1, tempdir.path().to_str().unwrap()).unwrap();
+			assert_eq!(db.num_columns(), 1);
 
-			for i in 0..5 {
+			for i in 2..=5 {
 				db.add_column().unwrap();
-				assert_eq!(db.num_columns(), i + 1);
+				assert_eq!(db.num_columns(), i);
 			}
 		}
 
@@ -817,44 +792,160 @@ mod tests {
 	}
 
 	#[test]
-	fn drop_columns() {
-		let config = DatabaseConfig::default();
-		let config_5 = DatabaseConfig::with_columns(Some(5));
+	fn remove_columns() {
+		let config_1 = DatabaseConfig::default();
+		let config_5 = DatabaseConfig::with_columns(5);
 
-		let tempdir = TempDir::new("").unwrap();
+		let tempdir = TempfileBuilder::new().prefix("drop_columns").tempdir().unwrap();
 
-		// open 5, remove all.
+		// open 5, remove 4.
 		{
-			let db = Database::open(&config_5, tempdir.path().to_str().unwrap()).unwrap();
+			let mut db = Database::open(&config_5, tempdir.path()).expect("open with 5 columns");
 			assert_eq!(db.num_columns(), 5);
 
-			for i in (0..5).rev() {
-				db.drop_column().unwrap();
+			for i in (1..5).rev() {
+				db.remove_last_column().unwrap();
 				assert_eq!(db.num_columns(), i);
 			}
 		}
 
-		// reopen as 0.
+		// reopen as 1.
 		{
-			let db = Database::open(&config, tempdir.path().to_str().unwrap()).unwrap();
-			assert_eq!(db.num_columns(), 0);
+			let db = Database::open(&config_1, tempdir.path().to_str().unwrap()).unwrap();
+			assert_eq!(db.num_columns(), 1);
 		}
 	}
 
 	#[test]
-	fn write_clears_buffered_ops() {
-		let tempdir = TempDir::new("").unwrap();
-		let config = DatabaseConfig::default();
-		let db = Database::open(&config, tempdir.path().to_str().unwrap()).unwrap();
+	fn test_num_keys() {
+		let tempdir = TempfileBuilder::new().prefix("").tempdir().unwrap();
+		let config = DatabaseConfig::with_columns(1);
+		let db = Database::open(&config, tempdir.path()).unwrap();
 
+		assert_eq!(db.num_keys(0).unwrap(), 0, "database is empty after creation");
+		let key1 = b"beef";
 		let mut batch = db.transaction();
-		batch.put(None, b"foo", b"bar");
-		db.write_buffered(batch);
-
-		let mut batch = db.transaction();
-		batch.put(None, b"foo", b"baz");
+		batch.put(0, key1, key1);
 		db.write(batch).unwrap();
+		assert_eq!(db.num_keys(0).unwrap(), 1, "adding a key increases the count");
+	}
 
-		assert_eq!(db.get(None, b"foo").unwrap().unwrap().as_ref(), b"baz");
+	#[test]
+	fn default_memory_budget() {
+		let c = DatabaseConfig::default();
+		assert_eq!(c.columns, 1);
+		assert_eq!(c.memory_budget(), DB_DEFAULT_COLUMN_MEMORY_BUDGET_MB * MB, "total memory budget is default");
+		assert_eq!(
+			c.memory_budget_for_col(0),
+			DB_DEFAULT_COLUMN_MEMORY_BUDGET_MB * MB,
+			"total memory budget for column 0 is the default"
+		);
+		assert_eq!(
+			c.memory_budget_for_col(999),
+			DB_DEFAULT_COLUMN_MEMORY_BUDGET_MB * MB,
+			"total memory budget for any column is the default"
+		);
+	}
+
+	#[test]
+	fn memory_budget() {
+		let mut c = DatabaseConfig::with_columns(3);
+		c.memory_budget = [(0, 10), (1, 15), (2, 20)].iter().cloned().collect();
+		assert_eq!(c.memory_budget(), 45 * MB, "total budget is the sum of the column budget");
+	}
+
+	#[test]
+	fn test_stats_parser() {
+		let raw = r#"rocksdb.row.cache.hit COUNT : 1
+rocksdb.db.get.micros P50 : 2.000000 P95 : 3.000000 P99 : 4.000000 P100 : 5.000000 COUNT : 0 SUM : 15
+"#;
+		let stats = stats::parse_rocksdb_stats(raw);
+		assert_eq!(stats["row.cache.hit"].count, 1);
+		assert!(stats["row.cache.hit"].times.is_none());
+		assert_eq!(stats["db.get.micros"].count, 0);
+		let get_times = stats["db.get.micros"].times.unwrap();
+		assert_eq!(get_times.sum, 15);
+		assert_eq!(get_times.p50, 2.0);
+		assert_eq!(get_times.p95, 3.0);
+		assert_eq!(get_times.p99, 4.0);
+		assert_eq!(get_times.p100, 5.0);
+	}
+
+	#[test]
+	fn rocksdb_settings() {
+		const NUM_COLS: usize = 2;
+		let mut cfg = DatabaseConfig { enable_statistics: true, ..DatabaseConfig::with_columns(NUM_COLS as u32) };
+		cfg.max_open_files = 123; // is capped by the OS fd limit (typically 1024)
+		cfg.compaction.block_size = 323232;
+		cfg.compaction.initial_file_size = 102030;
+		cfg.memory_budget = [(0, 30), (1, 300)].iter().cloned().collect();
+
+		let db_path = TempfileBuilder::new()
+			.prefix("config_test")
+			.tempdir()
+			.expect("the OS can create tmp dirs");
+		let db = Database::open(&cfg, db_path.path()).expect("can open a db");
+		let mut rocksdb_log = std::fs::File::open(format!("{}/LOG", db_path.path().to_str().unwrap()))
+			.expect("rocksdb creates a LOG file");
+		let mut settings = String::new();
+		let statistics = db.get_statistics();
+		assert!(statistics.contains_key("block.cache.hit"));
+
+		rocksdb_log.read_to_string(&mut settings).unwrap();
+		// Check column count
+		assert!(settings.contains("Options for column family [default]"), "no default col");
+		assert!(settings.contains("Options for column family [col0]"), "no col0");
+		assert!(settings.contains("Options for column family [col1]"), "no col1");
+
+		// Check max_open_files
+		assert!(settings.contains("max_open_files: 123"));
+
+		// Check block size
+		assert!(settings.contains(" block_size: 323232"));
+
+		// LRU cache (default column)
+		assert!(settings.contains("block_cache_options:\n    capacity : 8388608"));
+		// LRU cache for non-default columns is ⅓ of memory budget (including default column)
+		let lru_size = (330 * MB) / 3;
+		let needle = format!("block_cache_options:\n    capacity : {}", lru_size);
+		let lru = settings.match_indices(&needle).collect::<Vec<_>>().len();
+		assert_eq!(lru, NUM_COLS);
+
+		// Index/filters share cache
+		let include_indexes = settings.matches("cache_index_and_filter_blocks: 1").collect::<Vec<_>>().len();
+		assert_eq!(include_indexes, NUM_COLS);
+		// Pin index/filters on L0
+		let pins = settings
+			.matches("pin_l0_filter_and_index_blocks_in_cache: 1")
+			.collect::<Vec<_>>()
+			.len();
+		assert_eq!(pins, NUM_COLS);
+
+		// Check target file size, aka initial file size
+		let l0_sizes = settings.matches("target_file_size_base: 102030").collect::<Vec<_>>().len();
+		assert_eq!(l0_sizes, NUM_COLS);
+		// The default column uses the default of 64Mb regardless of the setting.
+		assert!(settings.contains("target_file_size_base: 67108864"));
+
+		// Check compression settings
+		let snappy_compression = settings.matches("Options.compression: Snappy").collect::<Vec<_>>().len();
+		// All columns use Snappy
+		assert_eq!(snappy_compression, NUM_COLS + 1);
+		// …even for L7
+		let snappy_bottommost = settings
+			.matches("Options.bottommost_compression: Disabled")
+			.collect::<Vec<_>>()
+			.len();
+		assert_eq!(snappy_bottommost, NUM_COLS + 1);
+
+		// 7 levels
+		let levels = settings.matches("Options.num_levels: 7").collect::<Vec<_>>().len();
+		assert_eq!(levels, NUM_COLS + 1);
+
+		// Don't fsync every store
+		assert!(settings.contains("Options.use_fsync: 0"));
+
+		// We're using the new format
+		assert!(settings.contains("format_version: 5"));
 	}
 }

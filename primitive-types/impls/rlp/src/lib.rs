@@ -1,4 +1,4 @@
-// Copyright 2015-2018 Parity Technologies
+// Copyright 2020 Parity Technologies
 //
 // Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
 // http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
@@ -8,11 +8,13 @@
 
 //! RLP serialization support for uint and fixed hash.
 
-#[doc(hidden)]
-pub extern crate rlp;
+#![cfg_attr(not(feature = "std"), no_std)]
 
 #[doc(hidden)]
-pub extern crate core as core_;
+pub use rlp;
+
+#[doc(hidden)]
+pub use core as core_;
 
 /// Add RLP serialization support to an integer created by `construct_uint!`.
 #[macro_export]
@@ -20,8 +22,8 @@ macro_rules! impl_uint_rlp {
 	($name: ident, $size: expr) => {
 		impl $crate::rlp::Encodable for $name {
 			fn rlp_append(&self, s: &mut $crate::rlp::RlpStream) {
-				let leading_empty_bytes = $size - (self.bits() + 7) / 8;
-				let mut buffer = [0u8; $size];
+				let leading_empty_bytes = $size * 8 - (self.bits() + 7) / 8;
+				let mut buffer = [0u8; $size * 8];
 				self.to_big_endian(&mut buffer);
 				s.encoder().encode_value(&buffer[leading_empty_bytes..]);
 			}
@@ -32,7 +34,7 @@ macro_rules! impl_uint_rlp {
 				rlp.decoder().decode_value(|bytes| {
 					if !bytes.is_empty() && bytes[0] == 0 {
 						Err($crate::rlp::DecoderError::RlpInvalidIndirection)
-					} else if bytes.len() <= $size {
+					} else if bytes.len() <= $size * 8 {
 						Ok($name::from(bytes))
 					} else {
 						Err($crate::rlp::DecoderError::RlpIsTooBig)
@@ -40,7 +42,7 @@ macro_rules! impl_uint_rlp {
 				})
 			}
 		}
-	}
+	};
 }
 
 /// Add RLP serialization support to a fixed-sized hash type created by `construct_fixed_hash!`.
@@ -62,9 +64,9 @@ macro_rules! impl_fixed_hash_rlp {
 						let mut t = [0u8; $size];
 						t.copy_from_slice(bytes);
 						Ok($name(t))
-					}
+					},
 				})
 			}
 		}
-	}
+	};
 }
